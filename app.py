@@ -1,42 +1,49 @@
 """
-AttendanceApp Backend API
-Run: python app.py
+AttendanceApp Backend — Full Featured
+New: Employee ID login, face enrollment, edit/delete staff, profile edit
 """
-
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import sqlite3, hashlib, os, base64, datetime, socket
+import sqlite3, hashlib, os, base64, datetime, json, random, string
 
 app = Flask(__name__)
-CORS(app)  # Allow requests from the frontend
+CORS(app)
 
-DB_FILE      = 'attendance.db'
+DB_FILE       = 'attendance.db'
 UPLOAD_FOLDER = 'uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# ─────────────────────────────────────────────────────────────
-# DATABASE SETUP
-# ─────────────────────────────────────────────────────────────
 def get_db():
     conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row   # Return rows as dicts
+    conn.row_factory = sqlite3.Row
     return conn
+
+def hash_password(p):
+    return hashlib.sha256(p.encode()).hexdigest()
+
+def generate_employee_id():
+    conn = get_db()
+    count = conn.execute('SELECT COUNT(*) as c FROM staff').fetchone()['c']
+    conn.close()
+    return f'EMP{str(count + 1).zfill(3)}'
 
 def init_db():
     conn = get_db()
     c = conn.cursor()
 
-    # Staff table
     c.execute('''CREATE TABLE IF NOT EXISTS staff (
-        id        INTEGER PRIMARY KEY AUTOINCREMENT,
-        name      TEXT NOT NULL,
-        email     TEXT UNIQUE NOT NULL,
-        password  TEXT NOT NULL,
-        role      TEXT DEFAULT 'staff',
-        created   TEXT DEFAULT CURRENT_TIMESTAMP
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        employee_id     TEXT UNIQUE,
+        name            TEXT NOT NULL,
+        email           TEXT UNIQUE NOT NULL,
+        phone           TEXT DEFAULT '',
+        password        TEXT NOT NULL,
+        role            TEXT DEFAULT 'staff',
+        face_descriptor TEXT DEFAULT NULL,
+        face_photo      TEXT DEFAULT NULL,
+        created         TEXT DEFAULT CURRENT_TIMESTAMP
     )''')
 
-    # Attendance table
     c.execute('''CREATE TABLE IF NOT EXISTS attendance (
         id            INTEGER PRIMARY KEY AUTOINCREMENT,
         staff_id      INTEGER NOT NULL,
@@ -47,12 +54,10 @@ def init_db():
         clock_in_lng  REAL,
         clock_out_lat REAL,
         clock_out_lng REAL,
-        photo         TEXT,
         status        TEXT DEFAULT 'present',
         FOREIGN KEY (staff_id) REFERENCES staff(id)
     )''')
 
-    # Live locations table
     c.execute('''CREATE TABLE IF NOT EXISTS locations (
         id         INTEGER PRIMARY KEY AUTOINCREMENT,
         staff_id   INTEGER NOT NULL,
@@ -62,104 +67,164 @@ def init_db():
         FOREIGN KEY (staff_id) REFERENCES staff(id)
     )''')
 
-    # Insert demo staff accounts
-    demo_staff = [
-        ('Rahul Kumar',  'staff@test.com',  hash_password('1234'),      'staff'),
-        ('Priya Sharma', 'priya@test.com',  hash_password('1234'),      'staff'),
-        ('Admin User',   'admin@test.com',  hash_password('admin123'),  'admin'),
+    # Migrate existing staff — add missing columns
+    try: c.execute('ALTER TABLE staff ADD COLUMN employee_id TEXT UNIQUE')
+    except: pass
+    try: c.execute('ALTER TABLE staff ADD COLUMN phone TEXT DEFAULT ""')
+    except: pass
+    try: c.execute('ALTER TABLE staff ADD COLUMN face_descriptor TEXT DEFAULT NULL')
+    except: pass
+    try: c.execute('ALTER TABLE staff ADD COLUMN face_photo TEXT DEFAULT NULL')
+    except: pass
+
+    # Demo staff
+    demo = [
+        ('EMP001', 'Rahul Kumar',  'staff@test.com',  '9876543210', hash_password('1234'),     'staff'),
+        ('EMP002', 'Priya Sharma', 'priya@test.com',  '9876543211', hash_password('1234'),     'staff'),
+        ('EMP003', 'Admin User',   'admin@test.com',  '9876543212', hash_password('admin123'), 'admin'),
     ]
-    for name, email, pwd, role in demo_staff:
+    for eid, name, email, phone, pwd, role in demo:
         try:
-            c.execute('INSERT INTO staff (name, email, password, role) VALUES (?,?,?,?)',
-                      (name, email, pwd, role))
-        except sqlite3.IntegrityError:
-            pass  # Already exists
+            c.execute('INSERT INTO staff (employee_id,name,email,phone,password,role) VALUES (?,?,?,?,?,?)',
+                      (eid, name, email, phone, pwd, role))
+        except: pass
+
+    # Assign employee IDs to existing staff without one
+    staff_without_id = conn.execute('SELECT id FROM staff WHERE employee_id IS NULL').fetchall()
+    for s in staff_without_id:
+        new_id = generate_employee_id()
+        conn.execute('UPDATE staff SET employee_id=? WHERE id=?', (new_id, s['id']))
 
     conn.commit()
     conn.close()
-    print("✅ Database ready")
+    print('✅ Database ready')
 
-def hash_password(password):
-    return hashlib.sha256(password.encode()).hexdigest()
+# ── HEALTH CHECK ──────────────────────────────────────────────
+@app.route('/')
+def home():
+    return jsonify({'status': 'AttendanceApp API running', 'version': '2.0'})
 
-# ─────────────────────────────────────────────────────────────
-# AUTH
-# ─────────────────────────────────────────────────────────────
+# ── LOGIN (email OR employee_id) ──────────────────────────────
 @app.route('/api/login', methods=['POST'])
 def login():
-    data  = request.json
-    email = data.get('email', '').strip()
-    pwd   = hash_password(data.get('password', ''))
-
-    conn = get_db()
+    data     = request.json
+    login_id = data.get('email', '').strip()
+    pwd      = hash_password(data.get('password', ''))
+    conn     = get_db()
+    # Try login with email first, then employee_id
     staff = conn.execute(
-        'SELECT * FROM staff WHERE email=? AND password=?', (email, pwd)
+        'SELECT * FROM staff WHERE (email=? OR employee_id=?) AND password=?',
+        (login_id, login_id.upper(), pwd)
     ).fetchone()
     conn.close()
-
     if not staff:
-        return jsonify({'success': False, 'message': 'Invalid email or password'}), 401
+        return jsonify({'success': False, 'message': 'Invalid credentials'}), 401
+    return jsonify({'success': True, 'token': f'token_{staff["id"]}',
+                    'user': {'id': staff['id'], 'name': staff['name'],
+                             'email': staff['email'], 'role': staff['role'],
+                             'employee_id': staff['employee_id'], 'phone': staff['phone'] or '',
+                             'face_enrolled': staff['face_descriptor'] is not None}})
 
-    return jsonify({
-        'success': True,
-        'token':   f'token_{staff["id"]}_{staff["email"]}',
-        'user': {
-            'id':    staff['id'],
-            'name':  staff['name'],
-            'email': staff['email'],
-            'role':  staff['role'],
-        }
-    })
+# ── GET PROFILE ───────────────────────────────────────────────
+@app.route('/api/staff/<int:staff_id>/profile')
+def get_profile(staff_id):
+    conn  = get_db()
+    staff = conn.execute('SELECT id,employee_id,name,email,phone,role,face_photo,created FROM staff WHERE id=?',
+                         (staff_id,)).fetchone()
+    conn.close()
+    if not staff: return jsonify({'success': False}), 404
+    return jsonify({'success': True, 'user': dict(staff)})
 
-# ─────────────────────────────────────────────────────────────
-# CLOCK IN
-# ─────────────────────────────────────────────────────────────
+# ── EDIT PROFILE ──────────────────────────────────────────────
+@app.route('/api/staff/<int:staff_id>/edit', methods=['PUT'])
+def edit_profile(staff_id):
+    data  = request.json
+    name  = data.get('name', '').strip()
+    phone = data.get('phone', '').strip()
+    if not name:
+        return jsonify({'success': False, 'message': 'Name is required'}), 400
+    conn = get_db()
+    conn.execute('UPDATE staff SET name=?, phone=? WHERE id=?', (name, phone, staff_id))
+    conn.commit()
+    conn.close()
+    return jsonify({'success': True, 'message': 'Profile updated!'})
+
+# ── CHANGE PASSWORD ───────────────────────────────────────────
+@app.route('/api/staff/<int:staff_id>/change-password', methods=['POST'])
+def change_password(staff_id):
+    data        = request.json
+    current_pwd = hash_password(data.get('current', ''))
+    new_pwd     = hash_password(data.get('new', ''))
+    conn        = get_db()
+    staff = conn.execute('SELECT password FROM staff WHERE id=?', (staff_id,)).fetchone()
+    if not staff or staff['password'] != current_pwd:
+        conn.close()
+        return jsonify({'success': False, 'message': 'Current password is incorrect'}), 400
+    conn.execute('UPDATE staff SET password=? WHERE id=?', (new_pwd, staff_id))
+    conn.commit()
+    conn.close()
+    return jsonify({'success': True, 'message': 'Password changed!'})
+
+# ── FACE ENROLLMENT ───────────────────────────────────────────
+@app.route('/api/staff/<int:staff_id>/enroll-face', methods=['POST'])
+def enroll_face(staff_id):
+    data       = request.json
+    descriptor = data.get('descriptor')  # JSON array from face-api.js
+    photo_b64  = data.get('photo', '')
+
+    if not descriptor:
+        return jsonify({'success': False, 'message': 'No face detected'}), 400
+
+    # Save face photo
+    photo_path = None
+    if photo_b64:
+        try:
+            photo_data = base64.b64decode(photo_b64.split(',')[-1])
+            photo_path = os.path.join(UPLOAD_FOLDER, f'face_{staff_id}.jpg')
+            with open(photo_path, 'wb') as f:
+                f.write(photo_data)
+        except: pass
+
+    conn = get_db()
+    conn.execute('UPDATE staff SET face_descriptor=?, face_photo=? WHERE id=?',
+                 (json.dumps(descriptor), photo_path, staff_id))
+    conn.commit()
+    conn.close()
+    return jsonify({'success': True, 'message': 'Face enrolled successfully!'})
+
+# ── GET FACE DESCRIPTOR (for comparison during clock-in) ──────
+@app.route('/api/staff/<int:staff_id>/face-descriptor')
+def get_face_descriptor(staff_id):
+    conn  = get_db()
+    staff = conn.execute('SELECT face_descriptor FROM staff WHERE id=?', (staff_id,)).fetchone()
+    conn.close()
+    if not staff or not staff['face_descriptor']:
+        return jsonify({'success': False, 'message': 'No face enrolled'}), 404
+    return jsonify({'success': True, 'descriptor': json.loads(staff['face_descriptor'])})
+
+# ── CLOCK IN ──────────────────────────────────────────────────
 @app.route('/api/clock-in', methods=['POST'])
 def clock_in():
     data     = request.json
     staff_id = data.get('staffId')
     lat      = data.get('latitude')
     lng      = data.get('longitude')
-    photo_b64 = data.get('photo', '')  # Base64 photo from frontend
     today    = datetime.date.today().isoformat()
     now      = datetime.datetime.now().strftime('%H:%M:%S')
-
-    # Save photo if provided
-    photo_path = None
-    if photo_b64:
-        try:
-            photo_data = base64.b64decode(photo_b64.split(',')[-1])
-            photo_path = os.path.join(UPLOAD_FOLDER, f'{staff_id}_{today}.jpg')
-            with open(photo_path, 'wb') as f:
-                f.write(photo_data)
-        except Exception:
-            pass
-
-    conn = get_db()
-
-    # Check if already clocked in today
-    existing = conn.execute(
-        'SELECT * FROM attendance WHERE staff_id=? AND date=?', (staff_id, today)
-    ).fetchone()
-
+    conn     = get_db()
+    existing = conn.execute('SELECT * FROM attendance WHERE staff_id=? AND date=?',
+                            (staff_id, today)).fetchone()
     if existing:
         conn.close()
         return jsonify({'success': False, 'message': 'Already clocked in today'}), 400
-
-    # Save attendance record
-    conn.execute('''INSERT INTO attendance
-        (staff_id, date, clock_in, clock_in_lat, clock_in_lng, photo)
-        VALUES (?,?,?,?,?,?)''',
-        (staff_id, today, now, lat, lng, photo_path))
+    conn.execute('INSERT INTO attendance (staff_id,date,clock_in,clock_in_lat,clock_in_lng) VALUES (?,?,?,?,?)',
+                 (staff_id, today, now, lat, lng))
     conn.commit()
     conn.close()
+    print(f'✅ Clock IN  — Staff {staff_id} at {now}')
+    return jsonify({'success': True, 'message': 'Clocked in!', 'time': now})
 
-    print(f"✅ Clock IN  — Staff {staff_id} at {now} ({lat}, {lng})")
-    return jsonify({'success': True, 'message': 'Clocked in successfully', 'time': now})
-
-# ─────────────────────────────────────────────────────────────
-# CLOCK OUT
-# ─────────────────────────────────────────────────────────────
+# ── CLOCK OUT ─────────────────────────────────────────────────
 @app.route('/api/clock-out', methods=['POST'])
 def clock_out():
     data     = request.json
@@ -168,158 +233,139 @@ def clock_out():
     lng      = data.get('longitude')
     today    = datetime.date.today().isoformat()
     now      = datetime.datetime.now().strftime('%H:%M:%S')
-
-    conn = get_db()
-    existing = conn.execute(
-        'SELECT * FROM attendance WHERE staff_id=? AND date=? AND clock_in IS NOT NULL',
-        (staff_id, today)
-    ).fetchone()
-
+    conn     = get_db()
+    existing = conn.execute('SELECT * FROM attendance WHERE staff_id=? AND date=? AND clock_in IS NOT NULL',
+                            (staff_id, today)).fetchone()
     if not existing:
         conn.close()
-        return jsonify({'success': False, 'message': 'You have not clocked in today'}), 400
-
-    if existing['clock_out']:
-        conn.close()
-        return jsonify({'success': False, 'message': 'Already clocked out today'}), 400
-
-    conn.execute('''UPDATE attendance
-        SET clock_out=?, clock_out_lat=?, clock_out_lng=?
-        WHERE staff_id=? AND date=?''',
-        (now, lat, lng, staff_id, today))
+        return jsonify({'success': False, 'message': 'Not clocked in today'}), 400
+    conn.execute('UPDATE attendance SET clock_out=?,clock_out_lat=?,clock_out_lng=? WHERE staff_id=? AND date=?',
+                 (now, lat, lng, staff_id, today))
     conn.commit()
     conn.close()
+    print(f'✅ Clock OUT — Staff {staff_id} at {now}')
+    return jsonify({'success': True, 'message': 'Clocked out!', 'time': now})
 
-    print(f"✅ Clock OUT — Staff {staff_id} at {now} ({lat}, {lng})")
-    return jsonify({'success': True, 'message': 'Clocked out successfully', 'time': now})
-
-# ─────────────────────────────────────────────────────────────
-# LIVE LOCATION UPDATE
-# ─────────────────────────────────────────────────────────────
+# ── LOCATION ──────────────────────────────────────────────────
 @app.route('/api/location', methods=['POST'])
 def update_location():
-    data     = request.json
-    staff_id = data.get('staffId')
-    lat      = data.get('latitude')
-    lng      = data.get('longitude')
-    now      = datetime.datetime.now().isoformat()
-
+    data = request.json
+    now  = datetime.datetime.now().isoformat()
     conn = get_db()
-    # Update or insert location
-    existing = conn.execute('SELECT id FROM locations WHERE staff_id=?', (staff_id,)).fetchone()
-    if existing:
-        conn.execute('UPDATE locations SET latitude=?, longitude=?, updated_at=? WHERE staff_id=?',
-                     (lat, lng, now, staff_id))
+    if conn.execute('SELECT id FROM locations WHERE staff_id=?', (data.get('staffId'),)).fetchone():
+        conn.execute('UPDATE locations SET latitude=?,longitude=?,updated_at=? WHERE staff_id=?',
+                     (data.get('latitude'), data.get('longitude'), now, data.get('staffId')))
     else:
-        conn.execute('INSERT INTO locations (staff_id, latitude, longitude, updated_at) VALUES (?,?,?,?)',
-                     (staff_id, lat, lng, now))
+        conn.execute('INSERT INTO locations (staff_id,latitude,longitude,updated_at) VALUES (?,?,?,?)',
+                     (data.get('staffId'), data.get('latitude'), data.get('longitude'), now))
     conn.commit()
     conn.close()
     return jsonify({'success': True})
 
-# ─────────────────────────────────────────────────────────────
-# GET ATTENDANCE HISTORY (for staff)
-# ─────────────────────────────────────────────────────────────
-@app.route('/api/attendance/<int:staff_id>', methods=['GET'])
+# ── ATTENDANCE HISTORY ────────────────────────────────────────
+@app.route('/api/attendance/<int:staff_id>')
 def get_attendance(staff_id):
-    conn = get_db()
-    records = conn.execute('''
-        SELECT a.*, s.name FROM attendance a
-        JOIN staff s ON a.staff_id = s.id
-        WHERE a.staff_id=? ORDER BY a.date DESC LIMIT 30
-    ''', (staff_id,)).fetchall()
+    conn    = get_db()
+    records = conn.execute('''SELECT a.*,s.name,s.email FROM attendance a
+        JOIN staff s ON a.staff_id=s.id WHERE a.staff_id=? ORDER BY a.date DESC LIMIT 30''',
+        (staff_id,)).fetchall()
     conn.close()
     return jsonify({'success': True, 'records': [dict(r) for r in records]})
 
-# ─────────────────────────────────────────────────────────────
-# GET TODAY'S ATTENDANCE (for staff)
-# ─────────────────────────────────────────────────────────────
-@app.route('/api/attendance/today/<int:staff_id>', methods=['GET'])
+@app.route('/api/attendance/today/<int:staff_id>')
 def get_today(staff_id):
     today = datetime.date.today().isoformat()
     conn  = get_db()
-    record = conn.execute(
-        'SELECT * FROM attendance WHERE staff_id=? AND date=?', (staff_id, today)
-    ).fetchone()
+    r = conn.execute('SELECT * FROM attendance WHERE staff_id=? AND date=?', (staff_id, today)).fetchone()
     conn.close()
-    return jsonify({'success': True, 'record': dict(record) if record else None})
+    return jsonify({'success': True, 'record': dict(r) if r else None})
 
-# ─────────────────────────────────────────────────────────────
-# ADMIN — ALL STAFF
-# ─────────────────────────────────────────────────────────────
+# ── ADMIN — GET ALL STAFF ─────────────────────────────────────
 @app.route('/api/admin/staff', methods=['GET'])
 def get_all_staff():
-    conn   = get_db()
-    staff  = conn.execute('SELECT id, name, email, role, created FROM staff').fetchall()
+    conn  = get_db()
+    staff = conn.execute('SELECT id,employee_id,name,email,phone,role,created FROM staff').fetchall()
     conn.close()
     return jsonify({'success': True, 'staff': [dict(s) for s in staff]})
 
-# ─────────────────────────────────────────────────────────────
-# ADMIN — ALL ATTENDANCE
-# ─────────────────────────────────────────────────────────────
-@app.route('/api/admin/attendance', methods=['GET'])
-def get_all_attendance():
-    date = request.args.get('date', datetime.date.today().isoformat())
-    conn = get_db()
-    records = conn.execute('''
-        SELECT a.*, s.name, s.email FROM attendance a
-        JOIN staff s ON a.staff_id = s.id
-        WHERE a.date=? ORDER BY a.clock_in DESC
-    ''', (date,)).fetchall()
-    conn.close()
-    return jsonify({'success': True, 'records': [dict(r) for r in records], 'date': date})
-
-# ─────────────────────────────────────────────────────────────
-# ADMIN — LIVE LOCATIONS
-# ─────────────────────────────────────────────────────────────
-@app.route('/api/admin/locations', methods=['GET'])
-def get_locations():
-    conn = get_db()
-    locs = conn.execute('''
-        SELECT l.*, s.name FROM locations l
-        JOIN staff s ON l.staff_id = s.id
-    ''').fetchall()
-    conn.close()
-    return jsonify({'success': True, 'locations': [dict(l) for l in locs]})
-
-# ─────────────────────────────────────────────────────────────
-# ADD NEW STAFF (admin)
-# ─────────────────────────────────────────────────────────────
+# ── ADMIN — ADD STAFF ─────────────────────────────────────────
 @app.route('/api/admin/staff', methods=['POST'])
 def add_staff():
     data = request.json
+    eid  = generate_employee_id()
     try:
         conn = get_db()
-        conn.execute('INSERT INTO staff (name, email, password, role) VALUES (?,?,?,?)',
-                     (data['name'], data['email'], hash_password(data['password']), data.get('role','staff')))
+        conn.execute('INSERT INTO staff (employee_id,name,email,phone,password,role) VALUES (?,?,?,?,?,?)',
+                     (eid, data['name'], data['email'], data.get('phone',''), hash_password(data['password']), data.get('role','staff')))
         conn.commit()
         conn.close()
-        return jsonify({'success': True, 'message': 'Staff added successfully'})
+        return jsonify({'success': True, 'message': f'Staff added! Employee ID: {eid}', 'employee_id': eid})
     except sqlite3.IntegrityError:
         return jsonify({'success': False, 'message': 'Email already exists'}), 400
 
-# ─────────────────────────────────────────────────────────────
-# START
-# ─────────────────────────────────────────────────────────────
-def get_local_ip():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+# ── ADMIN — EDIT STAFF ────────────────────────────────────────
+@app.route('/api/admin/staff/<int:staff_id>', methods=['PUT'])
+def admin_edit_staff(staff_id):
+    data  = request.json
+    conn  = get_db()
+    staff = conn.execute('SELECT * FROM staff WHERE id=?', (staff_id,)).fetchone()
+    if not staff:
+        conn.close()
+        return jsonify({'success': False, 'message': 'Staff not found'}), 404
+    name  = data.get('name', staff['name'])
+    email = data.get('email', staff['email'])
+    phone = data.get('phone', staff['phone'] or '')
+    role  = data.get('role', staff['role'])
     try:
-        s.connect(('8.8.8.8', 80))
-        return s.getsockname()[0]
-    finally:
-        s.close()
+        conn.execute('UPDATE staff SET name=?,email=?,phone=?,role=? WHERE id=?',
+                     (name, email, phone, role, staff_id))
+        if data.get('password'):
+            conn.execute('UPDATE staff SET password=? WHERE id=?', (hash_password(data['password']), staff_id))
+        conn.commit()
+        conn.close()
+        return jsonify({'success': True, 'message': 'Staff updated!'})
+    except sqlite3.IntegrityError:
+        conn.close()
+        return jsonify({'success': False, 'message': 'Email already exists'}), 400
+
+# ── ADMIN — DELETE STAFF ──────────────────────────────────────
+@app.route('/api/admin/staff/<int:staff_id>', methods=['DELETE'])
+def delete_staff(staff_id):
+    conn  = get_db()
+    staff = conn.execute('SELECT * FROM staff WHERE id=?', (staff_id,)).fetchone()
+    if not staff:
+        conn.close()
+        return jsonify({'success': False, 'message': 'Staff not found'}), 404
+    conn.execute('DELETE FROM attendance WHERE staff_id=?', (staff_id,))
+    conn.execute('DELETE FROM locations WHERE staff_id=?', (staff_id,))
+    conn.execute('DELETE FROM staff WHERE id=?', (staff_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({'success': True, 'message': 'Staff deleted!'})
+
+# ── ADMIN — ALL ATTENDANCE ────────────────────────────────────
+@app.route('/api/admin/attendance')
+def get_all_attendance():
+    date    = request.args.get('date', datetime.date.today().isoformat())
+    conn    = get_db()
+    records = conn.execute('''SELECT a.*,s.name,s.email,s.employee_id FROM attendance a
+        JOIN staff s ON a.staff_id=s.id WHERE a.date=? ORDER BY a.clock_in DESC''',
+        (date,)).fetchall()
+    conn.close()
+    return jsonify({'success': True, 'records': [dict(r) for r in records], 'date': date})
+
+# ── ADMIN — LIVE LOCATIONS ────────────────────────────────────
+@app.route('/api/admin/locations')
+def get_locations():
+    conn = get_db()
+    locs = conn.execute('SELECT l.*,s.name,s.employee_id FROM locations l JOIN staff s ON l.staff_id=s.id').fetchall()
+    conn.close()
+    return jsonify({'success': True, 'locations': [dict(l) for l in locs]})
+
+import sqlite3
+init_db()
 
 if __name__ == '__main__':
-    init_db()
-    ip = get_local_ip()
-    print("\n" + "="*50)
-    print("  AttendanceApp Backend is running!")
-    print("="*50)
-    print(f"  API URL: http://{ip}:5000")
-    print(f"\n  Demo accounts:")
-    print(f"  staff@test.com   / 1234")
-    print(f"  priya@test.com   / 1234")
-    print(f"  admin@test.com   / admin123")
-    print("="*50)
-    print("  Press Ctrl+C to stop\n")
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    port = int(os.environ.get('PORT', 5000))
+    print(f'\n✅ Backend running on port {port}\n')
+    app.run(host='0.0.0.0', port=port)
